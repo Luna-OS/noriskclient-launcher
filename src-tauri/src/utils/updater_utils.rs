@@ -47,6 +47,13 @@ fn remember_update_check(is_beta_channel: bool, result: Option<UpdateInfo>) {
 /// # Returns
 ///
 /// * `bool` - `true` if running in Flatpak, `false` otherwise.
+/// Self-updates are off in this fork: the official update feed points to the
+/// upstream installer, which would replace the forked launcher (and its Lu Hub
+/// theme). Set `NORISK_ENABLE_AUTO_UPDATE=1` to opt back in.
+pub fn self_update_disabled() -> bool {
+    std::env::var_os("NORISK_ENABLE_AUTO_UPDATE").is_none()
+}
+
 pub fn is_flatpak() -> bool {
     let is_flatpak = std::env::var("FLATPAK_ID").is_ok();
 

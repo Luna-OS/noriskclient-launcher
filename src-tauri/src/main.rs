@@ -484,11 +484,9 @@ async fn main() {
                             auto_check_updates_enabled = false;
                         }
 
-                        // Self-built/forked launchers must not replace themselves with the
-                        // official installer: no auto-update in debug builds or when
-                        // NORISK_DISABLE_AUTO_UPDATE is set.
-                        if cfg!(debug_assertions) || std::env::var_os("NORISK_DISABLE_AUTO_UPDATE").is_some() {
-                            info!("Automatic updates disabled (debug build or NORISK_DISABLE_AUTO_UPDATE).");
+                        // Forked launcher must not replace itself with the official installer
+                        if updater_utils::self_update_disabled() {
+                            info!("Automatic updates disabled (forked launcher; set NORISK_ENABLE_AUTO_UPDATE=1 to enable).");
                             auto_check_updates_enabled = false;
                         }
 

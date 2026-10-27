@@ -460,6 +460,9 @@ pub async fn reset_mobile_app_token() -> Result<String, CommandError> {
 #[tauri::command]
 pub async fn check_update_available_command(app: AppHandle) -> Result<Option<crate::utils::updater_utils::UpdateInfo>, CommandError> {
     debug!("Executing check_update_available_command");
+    if updater_utils::self_update_disabled() {
+        return Ok(None);
+    }
 
     let state = State::get().await?;
     let config = state.config_manager.get_config().await;
@@ -472,6 +475,10 @@ pub async fn check_update_available_command(app: AppHandle) -> Result<Option<cra
 #[tauri::command]
 pub async fn download_and_install_update_command(app: AppHandle) -> Result<(), CommandError> {
     debug!("Executing download_and_install_update_command");
+    if updater_utils::self_update_disabled() {
+        info!("Self-update is disabled in this fork; ignoring install request.");
+        return Ok(());
+    }
 
     let state = State::get().await?;
     let config = state.config_manager.get_config().await;
