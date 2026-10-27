@@ -2122,17 +2122,18 @@ pub async fn import_curseforge_pack_as_profile(
         profile.path
     );
 
-    // Ensure the target profile directory exists before extraction
+    // Ensure the target profile directory exists before extraction. The guard
+    // removes it again if anything below fails before the profile is saved.
     let target_dir = base_profiles_dir.join(&profile.path);
-    if !target_dir.exists() {
-        fs::create_dir_all(&target_dir).await.map_err(|e| {
+    let target_dir_guard = crate::utils::dir_guard::CreatedDirGuard::create(&target_dir)
+        .await
+        .map_err(|e| {
             error!(
                 "Failed to create target profile directory {:?}: {}",
                 target_dir, e
             );
             AppError::Io(e)
         })?;
-    }
 
     emit_progress(0.45, "Extracting files...".to_string()).await;
 
@@ -2159,6 +2160,7 @@ pub async fn import_curseforge_pack_as_profile(
         profile.name, profile.id
     );
     let profile_id = state.profile_manager.create_profile(profile).await?; // Use create_profile
+    target_dir_guard.disarm();
     info!(
         "Successfully created and saved profile with ID: {}",
         profile_id

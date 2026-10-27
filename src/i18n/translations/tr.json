@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "Tüm arayüz öğelerinin köşe yuvarlaklığını ayarlayın. 0px kare (Minecraft tarzı), daha yüksek değerler köşeleri daha yuvarlak yapar.",
   "settings.theme.title": "Tema",
   "settings.theme.description": "Başlatıcınızın görünümünü özelleştirmek için bir tema seçin",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Arka Plan Efekti",
   "settings.background.description": "Başlatıcı için bir arka plan efekti seçin",
   "settings.background.animations": "Animasyonlar",

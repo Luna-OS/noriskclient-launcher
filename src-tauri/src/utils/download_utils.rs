@@ -224,19 +224,20 @@ impl DownloadUtils {
                     error!("Download attempt {} failed for {}: {}", attempt + 1, url, e);
                     last_error = Some(e);
                     attempt += 1;
-                    
+
+                    // Clean up the partially downloaded file — also after the
+                    // last attempt. Files without a known size/hash are taken
+                    // as valid on the next run, so a leftover truncated file
+                    // would otherwise never be re-downloaded.
+                    if target_path.exists() {
+                        debug!("Cleaning up partially downloaded file: {:?}", target_path);
+                        if let Err(cleanup_err) = fs::remove_file(target_path).await {
+                            warn!("Failed to clean up partial file {:?}: {}", target_path, cleanup_err);
+                        }
+                    }
+
                     if attempt <= config.max_retries {
-                        // Clean up partially downloaded file
-                        if target_path.exists() {
-                            debug!("Cleaning up partially downloaded file: {:?}", target_path);
-                            if let Err(cleanup_err) = fs::remove_file(target_path).await {
-                                warn!("Failed to clean up partial file {:?}: {}", target_path, cleanup_err);
-                            }
-                        }
-                        
-                        if attempt < config.max_retries {
-                            trace!("Retrying download in next attempt...");
-                        }
+                        trace!("Retrying download in next attempt...");
                     }
                 }
             }

@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "Dostosuj zaokrąglenie rogów wszystkich elementów interfejsu. 0px to kąty proste (styl Minecraft), wyższe wartości zaokrąglają rogi bardziej.",
   "settings.theme.title": "Motyw",
   "settings.theme.description": "Wybierz motyw, aby dostosować wygląd launchera",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Efekt tła",
   "settings.background.description": "Wybierz efekt tła dla launchera",
   "settings.background.animations": "Animacje",

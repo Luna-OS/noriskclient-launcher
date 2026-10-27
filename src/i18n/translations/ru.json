@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "Настройте скругление углов всех элементов интерфейса. 0px — квадратные (стиль Minecraft), большие значения делают углы более округлыми.",
   "settings.theme.title": "Тема",
   "settings.theme.description": "Выберите тему для настройки внешнего вида лаунчера",
+  "settings.theme.lu_hub": "Лу Хаб",
   "settings.background.title": "Эффект фона",
   "settings.background.description": "Выберите эффект фона для лаунчера",
   "settings.background.animations": "Анимации",

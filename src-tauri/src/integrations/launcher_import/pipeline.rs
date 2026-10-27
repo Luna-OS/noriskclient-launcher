@@ -150,6 +150,15 @@ async fn unique_path_segment(name: &str) -> String {
     };
 
     let profiles_dir = default_profile_path();
+    // Same rules as every other profile folder: ASCII only (a non-ANSI path
+    // breaks the Java launch on Windows), no reserved device names.
+    if let Ok(segment) =
+        crate::utils::path_utils::find_unique_profile_segment(&profiles_dir, &base).await
+    {
+        return segment;
+    }
+
+    let base = crate::utils::path_utils::to_launchable_ascii(&base);
     let mut candidate = base.clone();
     let mut counter = 1;
 
@@ -162,6 +171,36 @@ async fn unique_path_segment(name: &str) -> String {
     }
 
     candidate
+}
+
+/// Instance folders with an import running right now (see `preview::instance_key`).
+static IMPORTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Held for the duration of one import; a second import of the same folder
+/// (double-click, two windows) fails fast instead of producing "Foo" and "Foo-1".
+struct InFlight(String);
+
+impl InFlight {
+    fn acquire(instance_dir: &Path) -> Result<Self> {
+        let key = preview::instance_key(instance_dir);
+        let mut set = IMPORTS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(key.clone()) {
+            return Err(AppError::Other(
+                "This instance is already being imported.".to_string(),
+            ));
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IMPORTS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
 }
 
 fn modpack_info_from(instance: &ExternalInstance) -> Option<ModPackInfo> {
@@ -309,6 +348,7 @@ pub async fn import_instance(request: ImportRequest) -> Result<Uuid> {
         state: state.clone(),
         event_id: request.event_id,
     };
+    let _in_flight = InFlight::acquire(&request.instance_dir)?;
     let guard: CancelGuard = control::register(request.event_id);
     let cancel = guard.flag();
 

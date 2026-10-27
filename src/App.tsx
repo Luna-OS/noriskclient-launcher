@@ -61,11 +61,13 @@ import { useMinecraftAuthStore } from "./store/minecraft-auth-store";
 import { useWelcomeStore } from "./store/welcome-store";
 import { useTwitchDeepLinkRequests } from "./components/account/TwitchLinkCard";
 import { useDeepLinkHandler } from "./hooks/useDeepLinkHandler";
+import { useLauncherThemeStore, LAUNCHER_THEMES } from "./store/launcher-theme-store";
 import { drainPendingDeepLinks } from "./services/deep-link-service";
 import { DEEP_LINK_SUPPORT_REQUEST_EVENT } from "./services/support-request-service";
 import { openSupportRequestDialog } from "./components/support/SupportRequestDialog";
 import { WelcomeScreen } from "./components/welcome/WelcomeScreen";
 import { useSettingsModalStore } from "./store/settings-modal-store";
+import { useProfileWizardStore } from "./store/profile-wizard-store";
 import { useSkinStore } from "./store/useSkinStore";
 import { invalidatePlayerAppearance } from "./services/cosmetic-cache";
 import { hasPermission, refreshPermissions } from "./services/permission-service";
@@ -327,6 +329,23 @@ export function App() {
     DEEP_LINK_SUPPORT_REQUEST_EVENT,
     (payload) => openSupportRequestDialog(payload?.code),
   );
+
+  // CLI: `open --profile <uuid>` / `open --theme <id>` (from the backend deep-link queue)
+  useDeepLinkHandler<{ profileId: string }>("cli-open-profile", ({ profileId }) => {
+    if (profileId) navigate(`/profilesv2/${profileId}`);
+  });
+
+  useDeepLinkHandler<{ theme: string }>("cli-set-theme", ({ theme }) => {
+    const store = useLauncherThemeStore.getState();
+    if (theme in LAUNCHER_THEMES && store.selectedThemeId !== theme) {
+      store.selectTheme(theme);
+    }
+  });
+
+  // CLI: `open --create` – opens the new-profile wizard
+  useDeepLinkHandler<unknown>("cli-create-profile", () => {
+    useProfileWizardStore.getState().openModal();
+  });
 
   useTwitchDeepLinkRequests();
 

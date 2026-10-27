@@ -8,14 +8,20 @@
 //!
 //! Both go through `tauri-plugin-cli`'s `matches()` / `matches_from(argv)` —
 //! the subcommand schema lives once in `tauri.conf.json`.
+//!
+//! The contract external launchers (Open Game Launcher) rely on is documented
+//! in `docs/OGL_INTEROP.md` — keep it in sync when changing subcommands here.
 
 use crate::commands::modpack_command::{run_modpack, ModpackArgs, PackSource};
 use crate::commands::profile_command::{
     launch_profile_with_overrides, launch_temp_profile, LaunchOverrides, TempLaunchArgs,
 };
 use crate::state::state_manager::State;
-use log::{error, info};
+use crate::utils::deep_link_utils::{deliver, focus_main_window};
+use log::{error, info, warn};
+use serde::Serialize;
 use tauri::AppHandle;
+use uuid::Uuid;
 use tauri_plugin_cli::{CliExt, SubcommandMatches};
 
 /// Quick-play target parsed from `--world` / `--server`. Mutually exclusive —
@@ -87,6 +93,61 @@ impl ModpackArgs {
     }
 }
 
+/// Frontend events emitted by `open`. Delivered through the deep-link queue so
+/// they survive a cold start (frontend drains them via `take_pending_deep_links`).
+pub const OPEN_PROFILE_EVENT: &str = "cli-open-profile";
+pub const SET_THEME_EVENT: &str = "cli-set-theme";
+pub const CREATE_PROFILE_EVENT: &str = "cli-create-profile";
+
+/// How long a CLI action waits for `State::init` before giving up.
+const STATE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Parsed `open` subcommand: show the launcher, optionally on a profile page,
+/// with a theme, or with the create-profile dialog open.
+#[derive(Debug, Default, PartialEq)]
+struct OpenArgs {
+    profile: Option<String>,
+    theme: Option<String>,
+    create: bool,
+}
+
+impl OpenArgs {
+    fn from_matches(sub: &SubcommandMatches) -> Result<Self, String> {
+        let theme = arg_str(sub, "theme");
+        if let Some(t) = &theme {
+            if !valid_theme_id(t) {
+                return Err(format!("--theme '{}' is not a valid theme id", t));
+            }
+        }
+        Ok(Self {
+            profile: arg_str(sub, "profile").filter(|p| !p.trim().is_empty()),
+            theme,
+            create: arg_flag(sub, "create"),
+        })
+    }
+}
+
+/// Theme ids are plain identifiers (`lu_hub`, `christmas`, ...). Anything else
+/// is rejected before it reaches the frontend.
+fn valid_theme_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProfilePayload {
+    profile_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct SetThemePayload {
+    theme: String,
+}
+
 impl TempLaunchArgs {
     fn from_matches(sub: &SubcommandMatches) -> Result<Self, String> {
         let game_version = arg_str(sub, "mc").ok_or_else(|| "--mc is required".to_string())?;
@@ -141,64 +202,47 @@ fn arg_list(sub: &SubcommandMatches, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Maps a parsed subcommand to its action. `Ok(None)` = not a dispatchable
+/// subcommand (unknown, or handled elsewhere like `version`).
+fn parse_action(sub: &SubcommandMatches) -> Result<Option<DispatchAction>, String> {
+    Ok(Some(match sub.name.as_str() {
+        "launch" => DispatchAction::Launch(LaunchArgs::from_matches(sub)?),
+        "temp" => DispatchAction::Temp(TempLaunchArgs::from_matches(sub)?),
+        "modpack" => DispatchAction::Modpack(ModpackArgs::from_matches(sub)?),
+        "open" => DispatchAction::Open(OpenArgs::from_matches(sub)?),
+        _ => return Ok(None),
+    }))
+}
+
 /// Cold-start dispatch. Returns `true` if the app should short-circuit GUI
 /// startup (e.g. after printing `version`).
 pub fn dispatch_cold_start(app: &AppHandle) -> bool {
     let matches = match app.cli().matches() {
         Ok(m) => m,
-        Err(_) => return false,
+        Err(e) => {
+            error!("[CLI cold] could not parse args: {}", e);
+            return false;
+        }
     };
     let Some(sub) = matches.subcommand else {
         return false;
     };
 
-    match sub.name.as_str() {
-        "version" => {
-            println!("nrc-launcher {}", env!("CARGO_PKG_VERSION"));
-            app.exit(0);
-            true
-        }
-        "launch" => {
-            match LaunchArgs::from_matches(&sub) {
-                Ok(args) => spawn_dispatch_after_state_init(
-                    app.clone(),
-                    DispatchAction::Launch(args),
-                    "cold",
-                ),
-                Err(e) => error!("[CLI cold] launch: {}", e),
-            }
-            false
-        }
-        "temp" => {
-            match TempLaunchArgs::from_matches(&sub) {
-                Ok(args) => spawn_dispatch_after_state_init(
-                    app.clone(),
-                    DispatchAction::Temp(args),
-                    "cold",
-                ),
-                Err(e) => error!("[CLI cold] temp: {}", e),
-            }
-            false
-        }
-        "modpack" => {
-            match ModpackArgs::from_matches(&sub) {
-                Ok(args) => spawn_dispatch_after_state_init(
-                    app.clone(),
-                    DispatchAction::Modpack(args),
-                    "cold",
-                ),
-                Err(e) => error!("[CLI cold] modpack: {}", e),
-            }
-            false
-        }
-        other => {
-            info!(
-                "[CLI cold] unknown subcommand '{}', falling through to GUI",
-                other
-            );
-            false
-        }
+    if sub.name == "version" {
+        println!("nrc-launcher {}", env!("CARGO_PKG_VERSION"));
+        app.exit(0);
+        return true;
     }
+
+    match parse_action(&sub) {
+        Ok(Some(action)) => spawn_action(app.clone(), action, "cold"),
+        Ok(None) => info!(
+            "[CLI cold] unknown subcommand '{}', falling through to GUI",
+            sub.name
+        ),
+        Err(e) => error!("[CLI cold] {}: {}", sub.name, e),
+    }
+    false
 }
 
 /// Hot-start dispatch (called from the single-instance callback). Returns
@@ -224,37 +268,17 @@ pub fn dispatch_hot_start(app: &AppHandle, argv: Vec<String>) -> bool {
     };
     info!("[CLI hot] subcommand '{}'", sub.name);
 
-    let action = match sub.name.as_str() {
-        "launch" => match LaunchArgs::from_matches(&sub) {
-            Ok(a) => DispatchAction::Launch(a),
-            Err(e) => {
-                error!("[CLI hot] launch: {}", e);
-                return false;
-            }
-        },
-        "temp" => match TempLaunchArgs::from_matches(&sub) {
-            Ok(a) => DispatchAction::Temp(a),
-            Err(e) => {
-                error!("[CLI hot] temp: {}", e);
-                return false;
-            }
-        },
-        "modpack" => match ModpackArgs::from_matches(&sub) {
-            Ok(a) => DispatchAction::Modpack(a),
-            Err(e) => {
-                error!("[CLI hot] modpack: {}", e);
-                return false;
-            }
-        },
-        _ => return false,
-    };
-
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_action(action, "hot").await;
-        let _ = app_handle;
-    });
-    true
+    match parse_action(&sub) {
+        Ok(Some(action)) => {
+            spawn_action(app.clone(), action, "hot");
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            error!("[CLI hot] {}: {}", sub.name, e);
+            false
+        }
+    }
 }
 
 /// Action picked up by either dispatch path.
@@ -262,9 +286,10 @@ enum DispatchAction {
     Launch(LaunchArgs),
     Temp(TempLaunchArgs),
     Modpack(ModpackArgs),
+    Open(OpenArgs),
 }
 
-async fn run_action(action: DispatchAction, tag: &'static str) {
+async fn run_action(app: &AppHandle, action: DispatchAction, tag: &'static str) {
     match action {
         DispatchAction::Launch(a) => {
             match launch_profile_with_overrides(
@@ -293,33 +318,202 @@ async fn run_action(action: DispatchAction, tag: &'static str) {
             run_modpack(a).await;
             info!("[CLI {}] Modpack install finished.", tag);
         }
+        DispatchAction::Open(a) => run_open(app, a, tag).await,
     }
 }
 
-/// Cold-start path: state initialization happens asynchronously in a separate
-/// setup-task. We poll until `State::get()` succeeds *and* the ProfileManager
-/// has its profiles loaded — `State::init` resolves Phase 1 before
-/// `on_state_ready` reads `profiles.json`, so `State::get().is_ok()` alone
-/// returns too early for the `launch` flow. (For `temp` we don't strictly need
-/// profiles loaded, but waiting is harmless — same poll keeps the code one
-/// path.)
-fn spawn_dispatch_after_state_init(app: AppHandle, action: DispatchAction, tag: &'static str) {
-    tauri::async_runtime::spawn(async move {
-        // Poll up to 60s (100ms × 600).
-        for _ in 0..600 {
-            if let Ok(state) = State::get().await {
-                if let Ok(profiles) = state.profile_manager.list_profiles().await {
-                    if !profiles.is_empty() {
-                        break;
-                    }
-                }
+async fn run_open(app: &AppHandle, args: OpenArgs, tag: &'static str) {
+    focus_main_window(app);
+    if let Some(theme) = args.theme {
+        info!("[CLI {}] open: theme '{}'", tag, theme);
+        deliver(app, SET_THEME_EVENT, SetThemePayload { theme });
+    }
+    if let Some(profile_ref) = args.profile {
+        match resolve_profile_id(&profile_ref).await {
+            Some(id) => {
+                info!("[CLI {}] open: profile {}", tag, id);
+                deliver(
+                    app,
+                    OPEN_PROFILE_EVENT,
+                    OpenProfilePayload {
+                        profile_id: id.to_string(),
+                    },
+                );
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            None => warn!(
+                "[CLI {}] open: no profile matches '{}', showing the launcher only",
+                tag, profile_ref
+            ),
         }
-        run_action(action, tag).await;
-        // Keep the AppHandle alive for the duration of the async task so the
-        // app doesn't tear down before install_minecraft_version's own spawn
-        // gets going.
-        let _ = app;
+    }
+    if args.create {
+        deliver(app, CREATE_PROFILE_EVENT, serde_json::json!({}));
+    }
+}
+
+/// UUID or exact (unique) profile name → profile id. Standard profiles are
+/// accepted by id too.
+async fn resolve_profile_id(profile_ref: &str) -> Option<Uuid> {
+    let state = State::get().await.ok()?;
+    let profiles = state.profile_manager.list_profiles().await.ok()?;
+    if let Ok(id) = Uuid::parse_str(profile_ref.trim()) {
+        let known = profiles.iter().any(|p| p.id == id)
+            || state
+                .norisk_version_manager
+                .get_profile_by_id(id)
+                .await
+                .is_some();
+        return known.then_some(id);
+    }
+    let mut named = profiles.iter().filter(|p| p.name == profile_ref);
+    match (named.next(), named.next()) {
+        (Some(p), None) => Some(p.id),
+        _ => None,
+    }
+}
+
+/// Runs an action once `State::init` has fully finished. Both the cold path
+/// (state still initializing) and the hot path (a second start can arrive
+/// while the first instance is still booting) go through here, so a CLI
+/// action never reads profiles before the database is open and migrated.
+fn spawn_action(app: AppHandle, action: DispatchAction, tag: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        if !State::wait_ready(STATE_READY_TIMEOUT).await {
+            error!(
+                "[CLI {}] launcher state not ready after {}s, dropping the CLI action",
+                tag,
+                STATE_READY_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        run_action(&app, action, tag).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri_plugin_cli::ArgData;
+
+    fn sub(name: &str, args: &[(&str, serde_json::Value)]) -> SubcommandMatches {
+        let mut s = SubcommandMatches::default();
+        s.name = name.to_string();
+        for (k, v) in args {
+            let mut a = ArgData::default();
+            a.value = v.clone();
+            a.occurrences = 1;
+            s.matches.args.insert(k.to_string(), a);
+        }
+        s
+    }
+
+    #[test]
+    fn open_parses_all_flags() {
+        let s = sub(
+            "open",
+            &[
+                ("profile", "3f1c2b8e-0d5a-4c1e-9f7a-2b6d8e9c0a11".into()),
+                ("theme", "lu_hub".into()),
+                ("create", true.into()),
+            ],
+        );
+        let a = OpenArgs::from_matches(&s).unwrap();
+        assert_eq!(
+            a.profile.as_deref(),
+            Some("3f1c2b8e-0d5a-4c1e-9f7a-2b6d8e9c0a11")
+        );
+        assert_eq!(a.theme.as_deref(), Some("lu_hub"));
+        assert!(a.create);
+    }
+
+    #[test]
+    fn open_without_args_is_plain_focus() {
+        let a = OpenArgs::from_matches(&sub("open", &[])).unwrap();
+        assert_eq!(a, OpenArgs::default());
+        // A blank profile is ignored, not an error.
+        let a = OpenArgs::from_matches(&sub("open", &[("profile", "  ".into())])).unwrap();
+        assert_eq!(a.profile, None);
+    }
+
+    #[test]
+    fn open_rejects_bad_theme() {
+        let long = "x".repeat(65);
+        for bad in ["", "../x", "lu hub", "a;b", long.as_str()] {
+            let s = sub("open", &[("theme", bad.into())]);
+            assert!(OpenArgs::from_matches(&s).is_err(), "accepted {:?}", bad);
+        }
+        assert!(valid_theme_id("lu_hub"));
+        assert!(valid_theme_id("christmas-2025"));
+    }
+
+    #[test]
+    fn launch_requires_profile_and_rejects_world_plus_server() {
+        assert!(LaunchArgs::from_matches(&sub("launch", &[])).is_err());
+        let s = sub(
+            "launch",
+            &[
+                ("profile", "x".into()),
+                ("world", "w".into()),
+                ("server", "s".into()),
+            ],
+        );
+        assert!(LaunchArgs::from_matches(&s).is_err());
+        let s = sub(
+            "launch",
+            &[
+                ("profile", "x".into()),
+                ("mods", " a.jar, ,b ".into()),
+                ("jvm-args", "-Xmx2G  -Dfoo=1".into()),
+            ],
+        );
+        let a = LaunchArgs::from_matches(&s).unwrap();
+        assert_eq!(a.local_mods, vec!["a.jar", "b"]);
+        assert_eq!(a.jvm_args, vec!["-Xmx2G", "-Dfoo=1"]);
+    }
+
+    #[test]
+    fn flag_semantics() {
+        assert!(!arg_flag(&sub("open", &[]), "create"));
+        assert!(arg_flag(&sub("open", &[("create", true.into())]), "create"));
+        assert!(!arg_flag(&sub("open", &[("create", false.into())]), "create"));
+    }
+
+    #[test]
+    fn parse_action_maps_subcommands() {
+        assert!(matches!(
+            parse_action(&sub("open", &[])),
+            Ok(Some(DispatchAction::Open(_)))
+        ));
+        assert!(matches!(parse_action(&sub("version", &[])), Ok(None)));
+        assert!(matches!(parse_action(&sub("nope", &[])), Ok(None)));
+        assert!(parse_action(&sub("launch", &[])).is_err());
+    }
+
+    /// The schema lives in tauri.conf.json; every subcommand and arg this module
+    /// reads must be declared there, otherwise clap rejects it at runtime.
+    #[test]
+    fn tauri_conf_declares_cli_schema() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let subs = &conf["plugins"]["cli"]["subcommands"];
+        let arg_names = |name: &str| -> Vec<String> {
+            subs[name]["args"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for a in ["profile", "theme", "create"] {
+            assert!(arg_names("open").contains(&a.to_string()), "open --{}", a);
+        }
+        for a in [
+            "profile", "mc", "loader", "world", "server", "mods", "jvm-args", "account",
+        ] {
+            assert!(arg_names("launch").contains(&a.to_string()), "launch --{}", a);
+        }
+        assert!(subs["version"].is_object());
+    }
 }

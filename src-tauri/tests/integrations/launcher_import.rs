@@ -343,6 +343,36 @@ async fn a_custom_instance_dir_inside_the_root_is_honoured() {
 }
 
 #[tokio::test]
+async fn an_absolute_instance_dir_outside_the_root_is_honoured() {
+    let temp = TempDir::new().unwrap();
+    let elsewhere = temp.path().join("D-drive").join("MC").join("Instances");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let root = prism_root(
+        temp.path(),
+        Some(&format!("InstanceDir={}", elsewhere.display().to_string().replace('\\', "/"))),
+    );
+
+    let resolved = detect::resolve_root(ExternalLauncher::PrismLauncher, &root)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.instances_dir, elsewhere);
+}
+
+#[tokio::test]
+async fn a_missing_absolute_instance_dir_falls_back_to_default() {
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("gone");
+    let root = prism_root(temp.path(), Some(&format!("InstanceDir={}", missing.display().to_string().replace('\\', "/"))));
+
+    let resolved = detect::resolve_root(ExternalLauncher::PrismLauncher, &root)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.instances_dir, root.join("instances"));
+}
+
+#[tokio::test]
 async fn a_prism_instance_reads_name_version_and_loader() {
     let temp = TempDir::new().unwrap();
     let root = prism_root(temp.path(), None);

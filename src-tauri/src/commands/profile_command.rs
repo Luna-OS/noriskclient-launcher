@@ -158,16 +158,21 @@ pub async fn create_profile(params: CreateProfileParams) -> Result<Uuid, Command
     // Annahme: profile.path speichert nur das Segment (den Ordnernamen)
     let profile_path = unique_segment;
 
-    TokioFs::create_dir_all(&base_profiles_dir.join(&profile_path))
-        .await
-        .map_err(|e| CommandError::from(AppError::Io(e)))?;
+    // Validate before touching the disk, so a bad loader leaves no empty folder.
+    let loader = ModLoader::from_str(&params.loader)?;
+
+    // Removed again if create_profile fails below.
+    let dir_guard =
+        crate::utils::dir_guard::CreatedDirGuard::create(&base_profiles_dir.join(&profile_path))
+            .await
+            .map_err(|e| CommandError::from(AppError::Io(e)))?;
 
     let profile = Profile {
         id: Uuid::new_v4(),
         name: params.name.clone(), // Der Anzeigename bleibt original
         path: profile_path,        // Verwende den eindeutigen Pfad/Segment
         game_version: params.game_version.clone(),
-        loader: ModLoader::from_str(&params.loader)?,
+        loader,
         loader_version: params.loader_version.clone(),
         created: Utc::now(),
         last_played: None,
@@ -192,6 +197,7 @@ pub async fn create_profile(params: CreateProfileParams) -> Result<Uuid, Command
     };
 
     let id = state.profile_manager.create_profile(profile.clone()).await?;
+    dir_guard.disarm();
 
     let mut props = std::collections::HashMap::new();
     props.insert("profile_name".to_string(), serde_json::Value::String(profile.name.clone()));
@@ -1045,6 +1051,20 @@ pub async fn update_modrinth_mod_version(
     Ok(())
 }
 
+/// Instance folders in the profiles dir that no profile points to
+/// (report-only; see `ProfileManager::find_orphaned_instance_dirs`).
+#[tauri::command]
+pub async fn list_orphaned_instance_dirs() -> Result<Vec<String>, CommandError> {
+    let state = State::get().await?;
+    Ok(state
+        .profile_manager
+        .find_orphaned_instance_dirs()
+        .await?
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
 // --- Custom Mod Commands ---
 
 #[tauri::command]
@@ -1651,20 +1671,32 @@ pub async fn copy_profile(params: CopyProfileParams) -> Result<Uuid, CommandErro
         extra: Default::default(),
     };
 
-    // 6. Erstelle das neue Profilverzeichnis
-    let new_profile_path = base_profiles_dir.join(&unique_segment);
-    TokioFs::create_dir_all(&new_profile_path)
-        .await
-        .map_err(|e| CommandError::from(AppError::Io(e)))?;
-
-    // 7. Berechne die vollständigen Pfade für Quell- und Zielverzeichnisse
+    // 6. Resolve where the copy really lives. A grouped profile with a shared
+    // folder resolves to the group dir (noriskclient/new, groups/<g>), not to
+    // `<profiles>/<unique_segment>` — creating that folder would leave an
+    // orphan nobody ever uses or deletes.
     let source_full_path = state
         .profile_manager
         .calculate_instance_path_for_profile(&source_profile)?;
-    // The calculate_instance_path_for_profile function has its own trace logging
+    let new_profile_path = state
+        .profile_manager
+        .calculate_instance_path_for_profile(&new_profile)?;
+    let shares_source_dir = new_profile_path == source_full_path;
+
+    // Removed again if copying or saving fails below.
+    let dir_guard = crate::utils::dir_guard::CreatedDirGuard::create(&new_profile_path)
+        .await
+        .map_err(|e| CommandError::from(AppError::Io(e)))?;
 
     // 8. Kopiere die Dateien basierend auf den Parametern
-    let files_copied = if let Some(include_files) = &params.include_files {
+    let files_copied = if shares_source_dir {
+        info!(
+            "New profile {} shares the instance folder {} with its source, nothing to copy",
+            new_profile.id,
+            new_profile_path.display()
+        );
+        0
+    } else if let Some(include_files) = &params.include_files {
         if !include_files.is_empty() {
             // Wenn eine nicht-leere Include-Liste angegeben wurde, kopiere nur diese Dateien
             info!(
@@ -1724,6 +1756,7 @@ pub async fn copy_profile(params: CopyProfileParams) -> Result<Uuid, CommandErro
 
     // 9. Speichere das neue Profil in der Datenbank
     let new_profile_id = state.profile_manager.create_profile(new_profile).await?;
+    dir_guard.disarm();
 
     // 10. Event auslösen, um das UI zu aktualisieren
     if let Err(e) = state

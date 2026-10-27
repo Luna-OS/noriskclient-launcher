@@ -7,6 +7,12 @@ export interface LauncherTheme {
   name: string;
   accentColor: AccentColor;
   backgroundImage?: string; // Path to background image (only for play screen)
+  /** Optional i18n key for the display name; falls back to `name`. */
+  nameKey?: string;
+  /** Optional CSS custom properties (e.g. "--background": "256 60% 5%") applied to :root while the theme is active. */
+  cssVars?: Record<string, string>;
+  /** Selected automatically on fresh installs (never overrides a stored choice). */
+  defaultForFreshInstall?: boolean;
   unlockRequirement?: {
     type: "advent-door";
     day: number;
@@ -32,6 +38,37 @@ export const LAUNCHER_THEMES: Record<string, LauncherTheme> = {
       day: 2,
     },
   },
+  lu_hub: {
+    id: "lu_hub",
+    name: "Lu Hub",
+    nameKey: "settings.theme.lu_hub",
+    accentColor: {
+      name: "Lu Hub Violet",
+      value: "#7c3aed", // white on accent 5.7:1
+      hoverValue: "#6d28d9", // white on hover 7.1:1
+      light: "#a78bfa", // accent-as-text on night background 7.2:1
+      dark: "#5b21b6",
+      shadowValue: "rgba(167, 139, 250, 0.5)", // lighter lilac glow
+      isCustom: true,
+    },
+    backgroundImage: "/themes/lu_hub.svg",
+    defaultForFreshInstall: true,
+    // Night-violet surfaces; text stays near-white (>= 12:1 on background, white-on-accent >= 4.5:1)
+    cssVars: {
+      "--background": "257 60% 6%",
+      "--foreground": "260 100% 98%",
+      "--card": "257 45% 11%",
+      "--popover": "257 45% 11%",
+      "--secondary": "258 30% 20%",
+      "--muted": "258 30% 20%",
+      "--muted-foreground": "256 40% 76%",
+      "--border": "258 32% 26%",
+      "--input": "258 32% 26%",
+      "--ring": "258 90% 66%",
+      "--text-secondary": "#c4b5fd",
+      "--text-muted": "#a899d6",
+    },
+  },
 };
 
 interface LauncherThemeState {
@@ -49,10 +86,15 @@ interface LauncherThemeState {
   getSelectedTheme: () => LauncherTheme | null;
 }
 
+// Initial value only applies when nothing is persisted yet; stored choices (including "no theme") win on rehydrate.
+function freshInstallThemeId(): string | null {
+  return Object.values(LAUNCHER_THEMES).find((t) => t.defaultForFreshInstall)?.id ?? null;
+}
+
 export const useLauncherThemeStore = create<LauncherThemeState>()(
   persist(
     (set, get) => ({
-      selectedThemeId: null,
+      selectedThemeId: freshInstallThemeId(),
       openedAdventDoors: [],
       originalAccentColor: null,
 

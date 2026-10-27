@@ -78,8 +78,16 @@ impl MinecraftAssetsDownloadService {
         info!("[Assets Download] Checking if we can reuse existing Minecraft assets");
 
         // Use the progress-aware version
+        // Reuse is an optimisation: a broken .minecraft (unreadable index, bad
+        // JSON) must not fail the install — fall back to downloading.
         let assets_reused =
-            mc_utils::try_reuse_minecraft_assets_with_progress(asset_index, profile_id).await?;
+            match mc_utils::try_reuse_minecraft_assets_with_progress(asset_index, profile_id).await {
+                Ok(reused) => reused,
+                Err(e) => {
+                    warn!("[Assets Download] Could not reuse existing Minecraft assets, downloading instead: {}", e);
+                    false
+                }
+            };
 
         if assets_reused {
             info!("[Assets Download] Successfully reused existing Minecraft assets");

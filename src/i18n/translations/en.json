@@ -44,6 +44,7 @@
   "settings.border_radius.tooltip": "Adjust the corner roundness of all UI elements. 0px is square (Minecraft-style), higher values make corners more rounded.",
   "settings.theme.title": "Theme",
   "settings.theme.description": "Select a theme to customize your launcher's appearance",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Background Effect",
   "settings.background.description": "Choose a background effect for the launcher",
   "settings.background.animations": "Animations",

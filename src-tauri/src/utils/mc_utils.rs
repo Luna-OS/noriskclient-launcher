@@ -154,6 +154,11 @@ pub fn get_default_minecraft_dir() -> PathBuf {
     }
 }
 
+/// A Minecraft asset object hash: exactly 40 hex digits (SHA-1).
+pub fn is_sha1_hex(hash: &str) -> bool {
+    hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Checks if standard Minecraft assets can be reused and copies them if possible
 /// Returns Ok(true) if assets were copied, Ok(false) if they weren't
 pub async fn try_reuse_minecraft_assets(asset_index: &AssetIndex) -> Result<bool> {
@@ -423,6 +428,13 @@ pub async fn try_reuse_minecraft_assets_with_progress(
                 object.get("hash").and_then(|h| h.as_str()),
                 object.get("size").and_then(|s| s.as_i64()),
             ) {
+                // The index comes from the user's .minecraft: a malformed hash
+                // would panic on the slice below or escape the objects dir.
+                if !is_sha1_hex(hash) {
+                    warn!("[MC Utils] Skipping asset {} with invalid hash {:?}", asset_name, hash);
+                    error_count += 1;
+                    continue;
+                }
                 // Create hash folder (first 2 chars of hash)
                 let hash_prefix = &hash[0..2];
                 let source_hash_dir = source_objects_dir.join(hash_prefix);
@@ -491,7 +503,14 @@ pub async fn try_reuse_minecraft_assets_with_progress(
 
                 // Copy the file
                 if source_file.exists() {
-                    match fs::copy(&source_file, &dest_file).await {
+                    // Objects are content-addressed and never modified, so a
+                    // hard link (same volume) reuses them without doubling disk
+                    // use; copy when linking is not possible.
+                    let reused = match fs::hard_link(&source_file, &dest_file).await {
+                        Ok(()) => Ok(0),
+                        Err(_) => fs::copy(&source_file, &dest_file).await,
+                    };
+                    match reused {
                         Ok(_) => {
                             debug!("[MC Utils] Copied asset: {} ({})", hash, asset_name);
                             copied_count += 1;
@@ -1908,5 +1927,22 @@ pub async fn get_base64_from_skin_source(source: &SkinSource) -> Result<String> 
             debug!("[MC Utils] Processing Base64 source");
             Ok(base64_content_data.base64_content.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod asset_hash_tests {
+    use super::is_sha1_hex;
+
+    #[test]
+    fn sha1_hex_validation() {
+        assert!(is_sha1_hex("bdf48ef6b5d0d23bbb02e17d04865216179f510a"));
+        assert!(is_sha1_hex("BDF48EF6B5D0D23BBB02E17D04865216179F510A"));
+        assert!(!is_sha1_hex(""));
+        assert!(!is_sha1_hex("a"));
+        assert!(!is_sha1_hex("../../../../../../../../../../../../etc/x"));
+        assert!(!is_sha1_hex("zzf48ef6b5d0d23bbb02e17d04865216179f510a"));
+        // multi-byte chars must not panic the [0..2] slice later on
+        assert!(!is_sha1_hex("ääf48ef6b5d0d23bbb02e17d04865216179f51"));
     }
 }

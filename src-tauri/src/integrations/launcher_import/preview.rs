@@ -44,13 +44,24 @@ pub fn security_report_for(instance: &ExternalInstance) -> ImportSecurityReport 
 pub async fn already_imported_at(instance_dir: &Path) -> Option<DateTime<Utc>> {
     let state = State::get().await.ok()?;
     let profiles = state.profile_manager.list_profiles().await.ok()?;
-    let needle = instance_dir.display().to_string().to_ascii_lowercase();
+    let needle = instance_key(instance_dir);
 
     profiles.into_iter().find_map(|profile| {
         let marker = profile.extra.get(IMPORTED_FROM_KEY)?;
         let imported: ImportedFrom = serde_json::from_value(marker.clone()).ok()?;
-        (imported.instance_dir.to_ascii_lowercase() == needle).then_some(imported.imported_at)
+        (instance_key(Path::new(&imported.instance_dir)) == needle)
+            .then_some(imported.imported_at)
     })
+}
+
+/// Comparison key for an instance folder. The same folder reaches us as
+/// `C:\X\inst` (auto-scan), `C:/X/inst/` (manually added root) or with the
+/// `\\?\` prefix canonicalize adds on Windows; all must compare equal.
+pub fn instance_key(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = resolved.to_string_lossy().replace('\\', "/");
+    let s = s.strip_prefix("//?/").unwrap_or(&s);
+    s.trim_end_matches('/').to_lowercase()
 }
 
 fn collect_warnings(instance: &ExternalInstance, plan: &CopyPlan) -> Vec<String> {

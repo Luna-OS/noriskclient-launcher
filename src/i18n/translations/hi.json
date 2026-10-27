@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "सभी UI तत्वों की कोने की गोलाई समायोजित करें। 0px वर्गाकार (Minecraft शैली) है, उच्च मान कोनों को अधिक गोल बनाते हैं।",
   "settings.theme.title": "थीम",
   "settings.theme.description": "अपने लॉन्चर की उपस्थिति अनुकूलित करने के लिए एक थीम चुनें",
+  "settings.theme.lu_hub": "लू हब",
   "settings.background.title": "पृष्ठभूमि प्रभाव",
   "settings.background.description": "लॉन्चर के लिए एक पृष्ठभूमि प्रभाव चुनें",
   "settings.background.animations": "एनिमेशन",

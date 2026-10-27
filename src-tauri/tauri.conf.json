@@ -91,6 +91,27 @@
             }
           ]
         },
+        "open": {
+          "description": "Show the launcher (start it or focus the running one), optionally on a profile page, with a theme or with the create-profile dialog",
+          "args": [
+            {
+              "name": "profile",
+              "short": "p",
+              "takesValue": true,
+              "description": "Open this profile's page (UUID or exact name)"
+            },
+            {
+              "name": "theme",
+              "short": "t",
+              "takesValue": true,
+              "description": "Switch to this launcher theme, e.g. lu_hub"
+            },
+            {
+              "name": "create",
+              "description": "Open the create-profile dialog"
+            }
+          ]
+        },
         "version": {
           "description": "Print launcher version and exit"
         },

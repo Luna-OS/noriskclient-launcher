@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "Regola l'arrotondamento degli angoli di tutti gli elementi UI. 0px è quadrato (stile Minecraft), valori più alti rendono gli angoli più arrotondati.",
   "settings.theme.title": "Tema",
   "settings.theme.description": "Seleziona un tema per personalizzare l'aspetto del launcher",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Effetto sfondo",
   "settings.background.description": "Scegli un effetto di sfondo per il launcher",
   "settings.background.animations": "Animazioni",

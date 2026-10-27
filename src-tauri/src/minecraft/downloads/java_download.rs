@@ -20,6 +20,121 @@ const JAVA_DIR: &str = "java";
 // Legacy Java component that requires x86_64 Java on ARM64 Macs
 const LEGACY_JAVA_COMPONENT: &str = "jre-legacy";
 
+/// Present in a runtime dir that `download_java` installed atomically.
+const JAVA_COMPLETE_MARKER: &str = ".nrc-complete";
+
+/// `rename` of a freshly extracted tree can briefly fail on Windows while a
+/// virus scanner still holds files in it; retry a few times.
+async fn rename_with_retry(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 10 => {
+                attempt += 1;
+                debug!("rename {:?} -> {:?} failed ({}), retry {}", from, to, e, attempt);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            Err(e) => {
+                error!("Could not move Java runtime into place {:?}: {}", to, e);
+                return Err(AppError::Io(e));
+            }
+        }
+    }
+}
+
+/// Mojang's platform folder name inside `runtime/<component>/`.
+fn mojang_runtime_platform() -> Option<&'static str> {
+    match (OS, ARCHITECTURE) {
+        (OperatingSystem::WINDOWS, Architecture::X64) => Some("windows-x64"),
+        (OperatingSystem::WINDOWS, Architecture::AARCH64) => Some("windows-arm64"),
+        (OperatingSystem::OSX, Architecture::X64) => Some("mac-os"),
+        (OperatingSystem::OSX, Architecture::AARCH64) => Some("mac-os-arm64"),
+        (OperatingSystem::LINUX, Architecture::X64) => Some("linux"),
+        _ => None,
+    }
+}
+
+/// Java binaries the official launcher may have installed for `component`,
+/// most likely first: `<runtime>/<component>/<platform>/<component>/bin/...`
+/// (macOS: `jre.bundle/Contents/Home/bin/java`). Runtime roots: `.minecraft`
+/// and the Microsoft Store launcher's LocalCache.
+fn mojang_runtime_candidates(
+    runtime_roots: &[PathBuf],
+    component: &str,
+    platform: &str,
+) -> Vec<PathBuf> {
+    // The component comes from the version JSON; keep it a single plain name.
+    if component.is_empty()
+        || !component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Vec::new();
+    }
+    runtime_roots
+        .iter()
+        .map(|root| {
+            let home = root.join(component).join(platform).join(component);
+            match OS {
+                OperatingSystem::WINDOWS => home.join("bin").join("javaw.exe"),
+                OperatingSystem::OSX => home
+                    .join("jre.bundle")
+                    .join("Contents")
+                    .join("Home")
+                    .join("bin")
+                    .join("java"),
+                _ => home.join("bin").join("java"),
+            }
+        })
+        .collect()
+}
+
+fn mojang_runtime_roots() -> Vec<PathBuf> {
+    let mut roots = vec![crate::utils::mc_utils::get_default_minecraft_dir().join("runtime")];
+    if cfg!(windows) {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            roots.push(
+                PathBuf::from(local)
+                    .join("Packages")
+                    .join("Microsoft.4297127D64EC6_8wekyb3d8bbwe")
+                    .join("LocalCache")
+                    .join("Local")
+                    .join("runtime"),
+            );
+        }
+    }
+    roots
+}
+
+/// An already installed official-launcher runtime for `component` whose major
+/// version is exactly `required_major` (probed with `java -version`).
+async fn find_mojang_runtime(component: &str, required_major: u32) -> Option<PathBuf> {
+    let platform = mojang_runtime_platform()?;
+    for binary in mojang_runtime_candidates(&mojang_runtime_roots(), component, platform) {
+        if !fs::try_exists(&binary).await.unwrap_or(false) {
+            continue;
+        }
+        // Probe the console binary: javaw.exe prints nothing.
+        let probe = if cfg!(windows) {
+            binary.with_file_name("java.exe")
+        } else {
+            binary.clone()
+        };
+        match crate::utils::java_detector::get_java_info(&probe).await {
+            Ok(info) if info.major_version == required_major && info.is_64bit => {
+                return Some(binary)
+            }
+            Ok(info) => debug!(
+                "Official runtime at {:?} is Java {} (64-bit: {}), need {}",
+                binary, info.major_version, info.is_64bit, required_major
+            ),
+            Err(e) => debug!("Official runtime at {:?} unusable: {}", binary, e),
+        }
+    }
+    None
+}
+
 pub struct JavaDownloadService {
     base_path: PathBuf,
 }
@@ -67,6 +182,20 @@ impl JavaDownloadService {
         {
             info!("Found existing Java installation at: {:?}", java_binary);
             return Ok(java_binary);
+        }
+
+        // Reuse the runtime the official Minecraft launcher already installed
+        // for exactly this component before downloading another copy.
+        if !force_x86_64 {
+            if let Some(component) = java_component {
+                if let Some(java_binary) = find_mojang_runtime(component, version).await {
+                    info!(
+                        "Reusing the official launcher's Java runtime '{}' at {:?}",
+                        component, java_binary
+                    );
+                    return Ok(java_binary);
+                }
+            }
         }
 
         // Download and setup Java
@@ -132,11 +261,19 @@ impl JavaDownloadService {
             version,
             if force_x86_64 { "_x86_64" } else { "" }
         );
-        let version_dir = self.base_path.join(dir_name);
-        fs::create_dir_all(&version_dir).await?;
+        let version_dir = self.base_path.join(&dir_name);
+
+        // Download and extract into a staging dir and rename it into place at
+        // the end. find_java_binary only checks that the binary exists, so a
+        // runtime extracted straight into version_dir and interrupted after
+        // bin/javaw.exe was written would be "found" and reused broken forever.
+        let staging_dir = self
+            .base_path
+            .join(format!(".{}.partial-{}", dir_name, uuid::Uuid::new_v4().simple()));
+        let staging_guard = crate::utils::dir_guard::CreatedDirGuard::create(&staging_dir).await?;
 
         // Save the downloaded file
-        let archive_path = version_dir.join(format!("java.{}", OS.get_archive_type()?));
+        let archive_path = staging_dir.join(format!("java.{}", OS.get_archive_type()?));
 
         // Download Java archive using the centralized utility (fixes issue #1203)
         let config = DownloadConfig::new()
@@ -149,11 +286,33 @@ impl JavaDownloadService {
             .map_err(|e| AppError::JavaDownload(format!("Failed to download Java archive: {}", e)))?;
 
         // Extract the archive
-        self.extract_java_archive(&archive_path, &version_dir)
+        self.extract_java_archive(&archive_path, &staging_dir)
             .await?;
 
         // Clean up the archive
         fs::remove_file(&archive_path).await?;
+
+        // Marks a runtime that was renamed into place complete. Written before
+        // the rename, so it appears atomically with the runtime.
+        fs::write(staging_dir.join(JAVA_COMPLETE_MARKER), b"").await?;
+
+        // A parallel launch may have finished installing the same runtime
+        // meanwhile: keep that one, our staging copy is dropped by the guard.
+        if fs::try_exists(version_dir.join(JAVA_COMPLETE_MARKER))
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(version_dir);
+        }
+
+        // Whatever is at version_dir now is an incomplete older install (a
+        // complete one would have been found before downloading).
+        if fs::try_exists(&version_dir).await.unwrap_or(false) {
+            info!("Replacing incomplete Java runtime at {:?}", version_dir);
+            fs::remove_dir_all(&version_dir).await?;
+        }
+        rename_with_retry(&staging_dir, &version_dir).await?;
+        staging_guard.disarm();
 
         Ok(version_dir)
     }
@@ -529,10 +688,12 @@ impl JavaDownloadService {
 
                     let metadata = fs::metadata(&java_binary).await?;
 
-                    if !metadata.permissions().mode() & 0o111 != 0 {
-                        // try to change permissions
+                    // `!mode & 0o111` used to parse as `(!mode) & 0o111`, and
+                    // set_mode(0o111) then stripped the read bits.
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o111 != 0o111 {
                         let mut permissions = metadata.permissions();
-                        permissions.set_mode(0o111);
+                        permissions.set_mode(mode | 0o755);
                         fs::set_permissions(&java_binary, permissions).await?;
                     }
                 }
@@ -598,5 +759,35 @@ impl JavaDownloadService {
         Err(AppError::JavaDownload(
             "Failed to find Java binary".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mojang_candidates_follow_launcher_layout() {
+        let roots = vec![PathBuf::from("mc").join("runtime")];
+        let c = mojang_runtime_candidates(&roots, "java-runtime-delta", "windows-x64");
+        assert_eq!(c.len(), 1);
+        let home = PathBuf::from("mc")
+            .join("runtime")
+            .join("java-runtime-delta")
+            .join("windows-x64")
+            .join("java-runtime-delta");
+        assert!(c[0].starts_with(&home), "{:?}", c[0]);
+    }
+
+    #[test]
+    fn mojang_candidates_reject_odd_components() {
+        let roots = vec![PathBuf::from("runtime")];
+        for bad in ["", "..", "../x", "a/b", "a b", "C:"] {
+            assert!(
+                mojang_runtime_candidates(&roots, bad, "windows-x64").is_empty(),
+                "{:?}",
+                bad
+            );
+        }
     }
 }

@@ -361,16 +361,17 @@ pub async fn import_noriskpack_as_profile(pack_path: PathBuf, event_id: Option<U
     info!("Prepared new profile with path: {}", exported_profile.path);
 
     // 7. Ensure the target profile directory exists (can be done once before spawning tasks)
+    // The guard removes the folder again if extraction or saving fails.
     let target_dir = base_profiles_dir.join(&exported_profile.path);
-    if !target_dir.exists() {
-        fs::create_dir_all(&target_dir).await.map_err(|e| {
+    let target_dir_guard = crate::utils::dir_guard::CreatedDirGuard::create(&target_dir)
+        .await
+        .map_err(|e| {
             error!(
                 "Failed to create target profile directory {:?}: {}",
                 target_dir, e
             );
             AppError::Io(e)
         })?;
-    }
 
     emit_progress(0.25, "Extracting files...".to_string()).await;
 
@@ -699,6 +700,7 @@ pub async fn import_noriskpack_as_profile(pack_path: PathBuf, event_id: Option<U
         .profile_manager
         .create_profile(exported_profile)
         .await?;
+    target_dir_guard.disarm();
     info!(
         "Successfully created and saved profile with ID: {}",
         profile_id
@@ -719,11 +721,10 @@ pub async fn handle_noriskpack_file_paths<R: tauri::Runtime>(
 
     // Iterate over string arguments. Skip the first one if these are direct command line args.
     // For single-instance plugin, all args might be relevant, but filtering by extension handles it.
-    let args_to_check = if args.len() > 1 && PathBuf::from(&args[0]).is_file() {
-        args.iter().skip(1) // Likely std::env::args(), skip executable path
-    } else {
-        args.iter().skip(0) // Potentially from single-instance, check all
-    };
+    // Likely std::env::args() → skip the executable path; from single-instance
+    // all args may be relevant.
+    let skip = usize::from(args.len() > 1 && PathBuf::from(&args[0]).is_file());
+    let args_to_check = args.iter().skip(skip);
 
     for arg_str in args_to_check {
         // Attempt to parse as URL first for file:// scheme, then as direct path

@@ -90,11 +90,22 @@ impl MmcAdapter {
 
     fn resolve_instances_dir(root: &Path, config: &CfgFile) -> PathBuf {
         let declared = config.get_non_empty("InstanceDir").unwrap_or("instances");
-        let candidate = if Path::new(declared).is_absolute() {
-            PathBuf::from(declared)
-        } else {
-            root.join(declared)
-        };
+        // An absolute InstanceDir is a folder the user picked in Prism/MultiMC
+        // (e.g. D:\MC\Instances); it is only read from, so accept it when it
+        // exists. Relative paths must not climb out of the launcher root.
+        if Path::new(declared).is_absolute() {
+            let absolute = PathBuf::from(declared);
+            if absolute.is_dir() {
+                return absolute;
+            }
+            log::warn!(
+                "InstanceDir '{}' of '{}' does not exist, using the default",
+                declared,
+                root.display()
+            );
+            return root.join("instances");
+        }
+        let candidate = root.join(declared);
 
         if stays_inside(root, &candidate) {
             candidate

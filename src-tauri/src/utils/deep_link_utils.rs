@@ -72,7 +72,7 @@ impl PendingDeepLinks {
     }
 }
 
-fn deliver<S: Serialize + Clone>(app_handle: &AppHandle, event: &str, payload: S) {
+pub(crate) fn deliver<S: Serialize + Clone>(app_handle: &AppHandle, event: &str, payload: S) {
     if let Some(pending) = app_handle.try_state::<PendingDeepLinks>() {
         match serde_json::to_value(&payload) {
             Ok(value) => {
@@ -182,7 +182,7 @@ pub fn is_main_window(window: &WebviewWindow) -> bool {
     window.label() == MAIN_WINDOW_LABEL
 }
 
-fn focus_main_window(app_handle: &AppHandle) {
+pub fn focus_main_window(app_handle: &AppHandle) {
     let Some(window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
     };

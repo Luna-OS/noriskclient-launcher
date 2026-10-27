@@ -14,7 +14,7 @@ use log::{error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri_plugin_dialog::FilePath;
 use tokio::fs;
@@ -1888,6 +1888,26 @@ impl ProfileManager {
         }
     }
 
+    /// Folders in the profiles dir that no profile (regular, transient or
+    /// standard) resolves to. Report-only — nothing is moved or deleted, since
+    /// a folder can still hold the only copy of someone's worlds.
+    pub async fn find_orphaned_instance_dirs(&self) -> Result<Vec<PathBuf>> {
+        self.ensure_profiles_loaded().await?;
+        let mut known: Vec<PathBuf> = Vec::new();
+        for profile in self.profiles.read().await.values() {
+            known.push(self.calculate_instance_path_for_profile(profile)?);
+        }
+        if let Ok(state) = crate::state::state_manager::State::get().await {
+            for profile in &state.norisk_version_manager.get_config().await.profiles {
+                known.push(self.calculate_instance_path_for_profile(profile)?);
+            }
+        }
+        let root = default_profile_path();
+        tokio::task::spawn_blocking(move || find_orphan_dirs(&root, &known))
+            .await
+            .map_err(|e| AppError::Other(format!("orphan scan panicked: {}", e)))
+    }
+
     pub async fn list_profiles(&self) -> Result<Vec<Profile>> {
         self.ensure_profiles_loaded().await?;
         let profiles = self.profiles.read().await;
@@ -2329,15 +2349,7 @@ impl ProfileManager {
 
     /// Builds the default path using profile.path segments
     pub fn build_path_from_profile_path(profile: &Profile) -> PathBuf {
-        let mut path = default_profile_path();
-        
-        // Explicitly split profile.path by '/' and push each segment
-        for segment in profile.path.split('/') {
-            if !segment.is_empty() {
-                path.push(segment);
-            }
-        }
-        path
+        join_profile_path(&default_profile_path(), &profile.path)
     }
 
     /// Calculates the group directory for a profile when using shared folder logic.
@@ -3754,6 +3766,82 @@ pub fn get_profile_mod_filename(source: &ModSource) -> crate::error::Result<Stri
     }
 }
 
+/// Joins a stored `profile.path` onto the profiles dir without ever leaving it.
+///
+/// `path` comes from the database, imports and the NoRisk API (standard
+/// profiles), so it is treated as untrusted: both separators split, and empty,
+/// dot/space-only (`.`, `..`, `. .` — Windows strips trailing dots and spaces,
+/// so `.. ` means `..`) and drive/ADS segments (`C:`, `name:stream`) are
+/// dropped. `PathBuf::push` with an absolute segment would otherwise replace
+/// the whole base, and `..` would climb out of the profiles dir.
+pub fn join_profile_path(base: &Path, path: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for segment in path.split(['/', '\\']) {
+        if segment.trim_matches(['.', ' ']).is_empty() || segment.contains(':') {
+            continue;
+        }
+        out.push(segment);
+    }
+    out
+}
+
+/// Path comparison key: Windows paths are case-insensitive.
+fn path_key(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Orphan scan over `root` (the profiles dir). Candidates are the top-level
+/// folders and the folders under `groups/`. A candidate is in use when a known
+/// instance path is the candidate itself or lies below it. Never reported:
+/// `noriskclient/` (shared NRC dirs and CLI temp instances, reaped
+/// separately), the `groups/` container, and dot-folders (`.import-*` staging
+/// dirs are swept at startup by `trash_utils::reap_import_staging`).
+pub fn find_orphan_dirs(root: &Path, known: &[PathBuf]) -> Vec<PathBuf> {
+    let known: Vec<String> = known.iter().map(|p| path_key(p)).collect();
+    let in_use = |candidate: &Path| {
+        let c = path_key(candidate);
+        known
+            .iter()
+            .any(|k| k == &c || k.starts_with(&format!("{}/", c)))
+    };
+    let subdirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut orphans = Vec::new();
+    for dir in subdirs(root) {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if name.starts_with('.') || name == "noriskclient" {
+            continue;
+        }
+        if name == "groups" {
+            orphans.extend(subdirs(&dir).into_iter().filter(|g| !in_use(g)));
+            continue;
+        }
+        if !in_use(&dir) {
+            orphans.push(dir);
+        }
+    }
+    orphans.sort();
+    orphans
+}
+
 pub fn default_profile_path() -> PathBuf {
     // Check cache first (same system as meta_dir)
     if let Ok(guard) = crate::config::CUSTOM_GAME_DIR_CACHE.read() {
@@ -3820,5 +3908,87 @@ impl Default for WindowSize {
             width: 854,
             height: 480,
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::join_profile_path;
+    use std::path::Path;
+
+    #[test]
+    fn join_profile_path_keeps_normal_segments() {
+        let base = Path::new("profiles");
+        assert_eq!(join_profile_path(base, "Survival"), base.join("Survival"));
+        assert_eq!(
+            join_profile_path(base, "noriskclient/new"),
+            base.join("noriskclient").join("new")
+        );
+        assert_eq!(join_profile_path(base, r"a\b"), base.join("a").join("b"));
+        assert_eq!(join_profile_path(base, "My Pack (1)"), base.join("My Pack (1)"));
+        assert_eq!(join_profile_path(base, "v1.21.1"), base.join("v1.21.1"));
+    }
+
+    #[test]
+    fn join_profile_path_never_escapes() {
+        let base = Path::new("profiles");
+        for evil in [
+            "",
+            "..",
+            "../../Desktop",
+            r"..\..\Desktop",
+            "/",
+            ". .",
+            "... ",
+            "C:",
+            r"C:\Users\Luna",
+            "/etc/passwd",
+            "x/../..",
+        ] {
+            let p = join_profile_path(base, evil);
+            assert!(p.starts_with(base), "{:?} -> {:?}", evil, p);
+            assert!(
+                !p.components().any(|c| c == std::path::Component::ParentDir),
+                "{:?} -> {:?}",
+                evil,
+                p
+            );
+        }
+        assert_eq!(join_profile_path(base, r"C:\Users\Luna"), base.join("Users").join("Luna"));
+        assert_eq!(join_profile_path(base, "evil:stream"), base.to_path_buf());
+    }
+
+    #[test]
+    fn orphan_scan_reports_only_unused_folders() {
+        use super::find_orphan_dirs;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for d in [
+            "Survival",
+            "Leftover",
+            "nested/inner",
+            "noriskclient/new",
+            "noriskclient/temp/abc",
+            "groups/friends",
+            "groups/old-group",
+            ".import-1234",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let known = vec![
+            root.join("Survival"),
+            root.join("nested").join("inner"),
+            root.join("groups").join("friends"),
+        ];
+        let orphans = find_orphan_dirs(root, &known);
+        let mut expected = vec![root.join("Leftover"), root.join("groups").join("old-group")];
+        expected.sort();
+        assert_eq!(orphans, expected);
+    }
+
+    #[test]
+    fn orphan_scan_missing_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(super::find_orphan_dirs(&tmp.path().join("nope"), &[]).is_empty());
     }
 }

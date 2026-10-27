@@ -30,7 +30,7 @@ pub async fn find_unique_profile_segment(
         ['/', '\\', '?', '!', '<', '>', '*', ':', '\'', '\"', '|'],
         "_",
     );
-    let sanitized_segment = to_launchable_ascii(&sanitized_segment);
+    let sanitized_segment = windows_safe_segment(&to_launchable_ascii(&sanitized_segment));
 
     // Bereinigen und sicherstellen, dass der Segmentname nicht leer ist
     let clean_segment = sanitized_segment.trim();
@@ -948,6 +948,24 @@ pub async fn download_and_replace_file(
     Ok(())
 }
 
+/// Makes a folder name Windows accepts as-is on every OS (profiles dirs get
+/// synced/copied between machines): Windows silently strips trailing dots and
+/// spaces (`Pack.` and `Pack` would be the same folder) and refuses device
+/// names like `CON`, `NUL`, `COM1` — also with an extension (`nul.txt`).
+pub fn windows_safe_segment(segment: &str) -> String {
+    let trimmed = segment.trim_end_matches(['.', ' ']);
+    let stem = trimmed.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("{}_", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Java decodes launch arguments with `sun.jnu.encoding` — on Windows the system ANSI code page,
 /// which `-Dsun.jnu.encoding=UTF-8` does not override. Anything outside it reaches the game as
 /// `?` and the launch dies on an unreadable path. Only the directory is restricted; the display
@@ -984,4 +1002,33 @@ pub fn to_launchable_ascii(segment: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("profile-{:06x}", hash & 0xffffff)
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    #[test]
+    fn windows_safe_segment_handles_reserved_and_trailing() {
+        assert_eq!(windows_safe_segment("Survival"), "Survival");
+        assert_eq!(windows_safe_segment("Pack. . "), "Pack");
+        assert_eq!(windows_safe_segment("CON"), "CON_");
+        assert_eq!(windows_safe_segment("nul"), "nul_");
+        assert_eq!(windows_safe_segment("com1"), "com1_");
+        assert_eq!(windows_safe_segment("LPT9.txt"), "LPT9.txt_");
+        assert_eq!(windows_safe_segment("Console"), "Console");
+        assert_eq!(windows_safe_segment("COM10"), "COM10");
+        assert_eq!(windows_safe_segment("v1.21.1"), "v1.21.1");
+    }
+
+    #[tokio::test]
+    async fn unique_segment_is_ascii_and_suffixed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = find_unique_profile_segment(tmp.path(), "Über Survival").await.unwrap();
+        assert!(first.is_ascii(), "{}", first);
+        std::fs::create_dir_all(tmp.path().join(&first)).unwrap();
+        let second = find_unique_profile_segment(tmp.path(), "Über Survival").await.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(find_unique_profile_segment(tmp.path(), "aux").await.unwrap(), "aux_");
+    }
 }

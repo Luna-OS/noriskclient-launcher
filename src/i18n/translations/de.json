@@ -44,6 +44,7 @@
   "settings.border_radius.tooltip": "Passe die Eckenrundung aller UI-Elemente an. 0px ist eckig (Minecraft-Stil), höhere Werte machen Ecken runder.",
   "settings.theme.title": "Theme",
   "settings.theme.description": "Wähle ein Theme um das Aussehen des Launchers anzupassen",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Hintergrundeffekt",
   "settings.background.description": "Wähle einen Hintergrundeffekt für den Launcher",
   "settings.background.animations": "Animationen",

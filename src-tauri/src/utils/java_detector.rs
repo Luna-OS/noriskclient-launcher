@@ -122,6 +122,11 @@ async fn detect_java_in_launcher_dir() -> Result<Vec<JavaInstallation>> {
         if !path.is_dir() {
             continue;
         }
+        // `.zulu_21.partial-*`: a download still being extracted (or one a
+        // crash left behind) — never offer it as a runtime.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
 
         info!(
             "Checking potential Java installation in: {}",

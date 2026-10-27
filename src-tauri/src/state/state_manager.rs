@@ -16,12 +16,18 @@ use crate::state::profile_state::ProfileManager;
 use crate::state::skin_state::{default_skins_path, SkinManager};
 use crate::state::sync_pack_state::SyncPackManager;
 use crate::utils::referral_utils;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 // Global state that will be initialized once
 static LAUNCHER_STATE: OnceCell<Arc<State>> = OnceCell::const_new();
+
+/// Set once `State::init` has run every post-init handler (DB open, profiles
+/// migrated and loaded). `State::get()` already succeeds after Phase 1, which is
+/// too early for anything that reads profiles from the database.
+static STATE_READY: AtomicBool = AtomicBool::new(false);
 
 pub struct State {
     pub initialized: bool,
@@ -207,6 +213,7 @@ impl State {
             // Don't fail initialization, just log the error
         }
 
+        STATE_READY.store(true, Ordering::Release);
         log::info!("State ready in {}ms", init_start.elapsed().as_millis());
 
         Ok(())
@@ -234,6 +241,23 @@ impl State {
         Ok(Arc::clone(
             LAUNCHER_STATE.get().expect("State is not initialized!"),
         ))
+    }
+
+    /// True once `init` completed all phases (see [`STATE_READY`]).
+    pub fn is_ready() -> bool {
+        STATE_READY.load(Ordering::Acquire)
+    }
+
+    /// Waits until `init` completed all phases. Returns `false` on timeout.
+    pub async fn wait_ready(timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !Self::is_ready() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        true
     }
 
     // Check if state is initialized

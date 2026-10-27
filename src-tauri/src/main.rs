@@ -53,7 +53,7 @@ use commands::profile_command::{
     abort_profile_launch, add_modrinth_content_to_profile, add_modrinth_mod_to_profile,
     batch_check_content_installed, check_for_group_migration_command, check_world_lock_status, copy_profile, copy_world,
     create_profile, delete_custom_mod, delete_mod_from_profile, delete_profile, delete_world,
-    export_profile, get_all_profiles_and_last_played, get_custom_mods, get_local_content,
+    export_profile, get_all_profiles_and_last_played, get_custom_mods, list_orphaned_instance_dirs, get_local_content,
     get_local_datapacks, get_local_resourcepacks, get_local_shaderpacks, get_log_file_content,
     get_norisk_packs, get_norisk_packs_resolved, get_profile, get_profile_directory_structure,
     get_profile_log_files,
@@ -164,10 +164,8 @@ async fn main() {
     info!("Starting NoRiskClient Launcher...");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_cli::init())
+        // Must be the first plugin (tauri-plugin-single-instance docs): a second
+        // start forwards its argv here and exits before any other plugin runs.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let logged_args: Vec<String> = argv
                 .iter()
@@ -186,30 +184,29 @@ async fn main() {
                 return;
             }
 
-            match app.get_webview_window("main") {
-                Some(window) => {
-                    if let Err(e) = window.show() {
-                        error!("SingleInstance: Failed to show main window: {}", e);
-                    }
-                    if let Err(e) = window.unminimize() {
-                        error!("SingleInstance: Failed to unminimize main window: {}", e);
-                    }
-                    if let Err(e) = window.set_focus() {
-                        error!("SingleInstance: Failed to focus main window: {}", e);
-                    }
-                    info!("SingleInstance: Brought existing window to front.");
-                }
-                None => {
-                    info!("SingleInstance: Main window not yet available, still starting up. Ignoring.");
-                }
+            // bring_to_front (show + unminimize + topmost toggle) also wins
+            // against Windows' foreground lock when started from another app.
+            if app.get_webview_window("main").is_some() {
+                utils::deep_link_utils::focus_main_window(app);
+                info!("SingleInstance: Brought existing window to front.");
+            } else {
+                info!("SingleInstance: Main window not yet available, still starting up. Ignoring.");
             }
         }))
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // Before the CLI dispatch: `open` queues frontend events in here
+            // until the frontend calls take_pending_deep_links.
+            app.manage(utils::deep_link_utils::PendingDeepLinks::default());
 
             // CLI cold-start: handle subcommands (version short-circuits GUI;
             // launch fires asynchronously after State::init completes).
@@ -317,8 +314,6 @@ async fn main() {
             } else {
                 info!("Deep link schemes registered successfully.");
             }
-
-            app.manage(utils::deep_link_utils::PendingDeepLinks::default());
 
             let deep_link_app_handle = app_handle.clone();
             app.deep_link().on_open_url(move |event| {
@@ -439,6 +434,20 @@ async fn main() {
                 // then deletes them for good. See utils::trash_utils.
                 tauri::async_runtime::spawn(async {
                     utils::trash_utils::reap_temp_profiles().await;
+                    // Partial copies from an import that was killed mid-way.
+                    utils::trash_utils::reap_import_staging().await;
+                    // Report-only: instance folders no profile points to.
+                    if let Ok(state) = state::state_manager::State::get().await {
+                        match state.profile_manager.find_orphaned_instance_dirs().await {
+                            Ok(orphans) if !orphans.is_empty() => log::warn!(
+                                "Found {} instance folder(s) without a profile: {:?}",
+                                orphans.len(),
+                                orphans
+                            ),
+                            Ok(_) => {}
+                            Err(e) => log::warn!("Orphaned instance scan failed: {}", e),
+                        }
+                    }
                 });
 
                 tauri::async_runtime::spawn(async {
@@ -657,6 +666,7 @@ async fn main() {
             get_process_log_cursor,
             fetch_crash_report,
             get_custom_mods,
+            list_orphaned_instance_dirs,
             get_local_resourcepacks,
             get_local_shaderpacks,
             get_local_datapacks,

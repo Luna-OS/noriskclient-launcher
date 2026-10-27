@@ -101,6 +101,7 @@
   "settings.border_radius.tooltip": "Ajustez l'arrondi des coins de tous les éléments de l'interface. 0px est carré (style Minecraft), des valeurs plus élevées rendent les coins plus arrondis.",
   "settings.theme.title": "Thème",
   "settings.theme.description": "Sélectionnez un thème pour personnaliser l'apparence de votre launcher",
+  "settings.theme.lu_hub": "Lu Hub",
   "settings.background.title": "Effet d'Arrière-plan",
   "settings.background.description": "Choisissez un effet d'arrière-plan pour le launcher",
   "settings.background.animations": "Animations",

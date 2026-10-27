@@ -226,6 +226,21 @@ export function AppLayout({
     return () => ctx.revert();
   }, []);
 
+  // Apply optional theme surface variables (cleaned up when the theme changes)
+  useEffect(() => {
+    const vars = isThemeActive ? selectedTheme?.cssVars : undefined;
+    if (!vars) return;
+    const root = document.documentElement;
+    const previous = Object.keys(vars).map((k) => [k, root.style.getPropertyValue(k)] as const);
+    for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+    return () => {
+      for (const [k, v] of previous) {
+        if (v) root.style.setProperty(k, v);
+        else root.style.removeProperty(k);
+      }
+    };
+  }, [isThemeActive, selectedTheme]);
+
   const renderBackgroundEffect = () => {
     // Show theme background image only on play screen - override all other effects
     if (isThemeActive && selectedTheme?.backgroundImage && activeTab === "play") {

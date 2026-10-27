@@ -27,7 +27,19 @@ async fn ensure_trash_dir(category: Option<&str>) -> Result<PathBuf> {
 /// Moves a file or directory at `source_path` into the trash under an optional category.
 /// Returns the final wrapper directory created in the trash that contains the moved item.
 pub async fn move_path_to_trash<P: AsRef<Path>>(source_path: P, category: Option<&str>) -> Result<PathBuf> {
-    let source_path = source_path.as_ref();
+    move_to_trash(source_path.as_ref(), category, true).await
+}
+
+/// Like [`move_path_to_trash`] but never falls back to copy+delete. On Windows
+/// a rename fails while a process holds files open in the tree (e.g. a game
+/// still running from it); the fallback would then delete whatever is not
+/// locked and leave a half-gutted folder behind. Use this for best-effort
+/// background sweeps.
+pub async fn rename_path_to_trash<P: AsRef<Path>>(source_path: P, category: Option<&str>) -> Result<PathBuf> {
+    move_to_trash(source_path.as_ref(), category, false).await
+}
+
+async fn move_to_trash(source_path: &Path, category: Option<&str>, allow_copy: bool) -> Result<PathBuf> {
 
     if !source_path.exists() {
         return Err(AppError::Other(format!(
@@ -61,13 +73,18 @@ pub async fn move_path_to_trash<P: AsRef<Path>>(source_path: P, category: Option
     let target_path = wrapper_dir.join(original_name);
 
     // try fast rename (same volume)
-    match fs::rename(&source_path, &target_path).await {
+    match fs::rename(source_path, &target_path).await {
         Ok(_) => {
             info!(
                 "Moved '{}' to trash at '{}'",
                 source_path.display(),
                 target_path.display()
             );
+        }
+        Err(rename_err) if !allow_copy => {
+            // Don't leave the empty wrapper behind.
+            let _ = fs::remove_dir_all(&wrapper_dir).await;
+            return Err(AppError::Io(rename_err));
         }
         Err(rename_err) => {
             warn!(
@@ -76,10 +93,10 @@ pub async fn move_path_to_trash<P: AsRef<Path>>(source_path: P, category: Option
                 rename_err
             );
             // copy recursively if dir, else copy file
-            let meta = fs::metadata(&source_path).await.map_err(AppError::Io)?;
+            let meta = fs::metadata(source_path).await.map_err(AppError::Io)?;
             if meta.is_dir() {
                 // recursive copy via walkdir
-                if let Err(e) = copy_dir_recursive(&source_path, &target_path).await {
+                if let Err(e) = copy_dir_recursive(source_path, &target_path).await {
                     error!(
                         "Failed to copy directory '{}' to trash '{}': {}",
                         source_path.display(),
@@ -88,10 +105,10 @@ pub async fn move_path_to_trash<P: AsRef<Path>>(source_path: P, category: Option
                     );
                     return Err(e);
                 }
-                fs::remove_dir_all(&source_path).await.map_err(AppError::Io)?;
+                fs::remove_dir_all(source_path).await.map_err(AppError::Io)?;
             } else {
-                fs::copy(&source_path, &target_path).await.map_err(AppError::Io)?;
-                fs::remove_file(&source_path).await.map_err(AppError::Io)?;
+                fs::copy(source_path, &target_path).await.map_err(AppError::Io)?;
+                fs::remove_file(source_path).await.map_err(AppError::Io)?;
             }
         }
     }
@@ -214,9 +231,15 @@ pub async fn reap_temp_profiles() {
     let mut swept: u32 = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        match move_path_to_trash(&path, Some("temp-profiles")).await {
+        // Rename only: a temp game can outlive the launcher; its folder is
+        // locked then and stays until the next start.
+        match rename_path_to_trash(&path, Some("temp-profiles")).await {
             Ok(_) => swept += 1,
-            Err(e) => warn!("[temp-reap] failed to trash {}: {}", path.display(), e),
+            Err(e) => warn!(
+                "[temp-reap] skipped {} (still in use?): {}",
+                path.display(),
+                e
+            ),
         }
     }
 
@@ -224,6 +247,46 @@ pub async fn reap_temp_profiles() {
         info!("[temp-reap] swept {} temp profile(s) into trash", swept);
     }
 }
+
+/// Deletes `.import-<uuid>` staging folders left in the profiles dir by a
+/// launcher import that was killed mid-copy (`StagingDir`'s Drop never ran).
+/// They only ever hold a partial *copy* — the source instance is untouched —
+/// so they are removed outright instead of trashed. Called once at startup,
+/// before any import can be running.
+pub async fn reap_import_staging() {
+    let root = crate::state::profile_state::default_profile_path();
+    let removed = tokio::task::spawn_blocking(move || reap_import_staging_in(&root))
+        .await
+        .unwrap_or(0);
+    if removed > 0 {
+        info!("[import-reap] removed {} stale import staging folder(s)", removed);
+    }
+}
+
+pub fn is_import_staging_name(name: &str) -> bool {
+    name.strip_prefix(".import-")
+        .is_some_and(|rest| Uuid::parse_str(rest).is_ok())
+}
+
+fn reap_import_staging_in(root: &Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir || !is_import_staging_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => warn!("[import-reap] could not remove {}: {}", path.display(), e),
+        }
+    }
+    removed
+}
+
 
 async fn read_trashed_at(wrapper_dir: &Path) -> Result<u64> {
     let now = Utc::now();
@@ -251,3 +314,33 @@ async fn infer_age_from_fs(path: &Path) -> Result<u64> {
         .num_seconds();
     Ok(if age_secs < 0 { 0 } else { age_secs as u64 })
 } 
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    #[test]
+    fn staging_name_detection() {
+        assert!(is_import_staging_name(&format!(".import-{}", Uuid::new_v4())));
+        assert!(!is_import_staging_name(".import-"));
+        assert!(!is_import_staging_name(".import-notauuid"));
+        assert!(!is_import_staging_name("import-123"));
+        assert!(!is_import_staging_name("My Profile"));
+    }
+
+    #[test]
+    fn reaps_only_staging_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let staging = root.join(format!(".import-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        std::fs::write(staging.join("mods").join("a.jar"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("Survival")).unwrap();
+        std::fs::create_dir_all(root.join(".import-keep-me")).unwrap();
+
+        assert_eq!(reap_import_staging_in(root), 1);
+        assert!(!staging.exists());
+        assert!(root.join("Survival").exists());
+        assert!(root.join(".import-keep-me").exists());
+    }
+}
