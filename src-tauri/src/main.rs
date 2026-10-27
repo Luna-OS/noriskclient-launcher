@@ -484,6 +484,14 @@ async fn main() {
                             auto_check_updates_enabled = false;
                         }
 
+                        // Self-built/forked launchers must not replace themselves with the
+                        // official installer: no auto-update in debug builds or when
+                        // NORISK_DISABLE_AUTO_UPDATE is set.
+                        if cfg!(debug_assertions) || std::env::var_os("NORISK_DISABLE_AUTO_UPDATE").is_some() {
+                            info!("Automatic updates disabled (debug build or NORISK_DISABLE_AUTO_UPDATE).");
+                            auto_check_updates_enabled = false;
+                        }
+
                         if auto_check_updates_enabled {
                             trace!("Initiating application update check (Channel determined by config: Beta={})...", check_beta_channel);
                             updater_utils::check_for_updates(state_init_app_handle.clone(), check_beta_channel, updater_window.clone()).await;

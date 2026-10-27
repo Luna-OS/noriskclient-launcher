@@ -332,7 +332,9 @@ export function App() {
 
   // CLI: `open --profile <uuid>` / `open --theme <id>` (from the backend deep-link queue)
   useDeepLinkHandler<{ profileId: string }>("cli-open-profile", ({ profileId }) => {
-    if (profileId) navigate(`/profilesv2/${profileId}`);
+    if (!profileId) return;
+    useProfileWizardStore.getState().closeModal();
+    navigate(`/profilesv2/${profileId}`);
   });
 
   useDeepLinkHandler<{ theme: string }>("cli-set-theme", ({ theme }) => {
